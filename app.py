@@ -17,6 +17,51 @@ load_dotenv()  # loads .env in current directory
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+import re
+import html
+def safe_render_review(title: str, text: str):
+    """
+    Render review text safely.
+    Uses st.write normally, falls back to text_area if rendering glitches.
+    """
+    st.markdown(title)
+
+    if not text or not isinstance(text, str):
+        st.write("No review available.")
+        return
+
+    # Heuristic: very long lines or suspicious unicode → text_area
+    if len(text) > 1200 or any(c in text for c in ["\u2028", "\u2029", "\u200b"]):
+        st.text_area(
+            label="",
+            value=text,
+            height=260,
+            disabled=True
+        )
+    else:
+        st.write(text)
+def clean_review_for_display(x: str) -> str:
+    if x is None:
+        return ""
+    x = str(x)
+
+    # common mojibake fixes (CSV/encoding artifacts)
+    x = (x.replace("â€™", "'")
+           .replace("â€œ", '"')
+           .replace("â€�", '"')
+           .replace("â€“", "-")
+           .replace("â€”", "-")
+           .replace("Â", ""))   # leftover non-breaking-space marker
+
+    # normalize whitespace + remove invisible/control chars
+    x = x.replace("\xa0", " ")              # non-breaking spaces
+    x = x.replace("\u200b", "")             # zero-width space
+    x = x.replace("\u2028", " ").replace("\u2029", " ")
+    x = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", x)  # control chars
+    x = re.sub(r"\s+", " ", x).strip()      # collapse whitespace
+
+    return x
+
 # ----------------------------
 # Styles
 # ----------------------------
@@ -167,6 +212,12 @@ row = filtered[filtered["productName"] == selected_product].iloc[0]
 # ----------------------------
 # Chat state (reset when product changes)
 # ----------------------------
+# --- Chat session state ---
+
+if "pending_q" not in st.session_state:
+    st.session_state.pending_q = None
+
+
 if "active_product" not in st.session_state:
     st.session_state.active_product = None
 
@@ -177,6 +228,7 @@ if "chat_history" not in st.session_state:
 if st.session_state.active_product != selected_product:
     st.session_state.active_product = selected_product
     st.session_state.chat_history = []
+    st.session_state.pending_q = None   
 
 # ----------------------------
 # Context builder (for OpenAI)
@@ -267,40 +319,63 @@ def chat_modal(context_text: str):
     dialog_fn = getattr(st, "dialog", None)
 
     def render_chat_body():
-        st.caption("🔒 Evidence-grounded answers • 🧾 Uses topics + top reviews + pros/cons • ♻️ Resets when product changes")
+        st.caption(
+            "🔒 Evidence-grounded answers • 🧾 Uses topics + top reviews + pros/cons • ♻️ Resets when product changes"
+        )
 
-        # Suggested prompts
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("What do people like most?", use_container_width=True):
-                st.session_state.chat_history.append({"role": "user", "content": "What do people like most?"})
-        with c2:
-            if st.button("Biggest complaints?", use_container_width=True):
-                st.session_state.chat_history.append({"role": "user", "content": "What are the biggest complaints?"})
-        with c3:
-            if st.button("Should I buy it?", use_container_width=True):
-                st.session_state.chat_history.append({"role": "user", "content": "Would you recommend it? Who is it best for?"})
+        # -------------------------
+        # Preset question buttons
+        # -------------------------
+        q1, q2, q3 = st.columns(3)
+
+        if q1.button("What do people like most?", use_container_width=True):
+            st.session_state.pending_q = "What do people like most about this product?"
+
+        if q2.button("Biggest complaints?", use_container_width=True):
+            st.session_state.pending_q = "What are the biggest complaints about this product?"
+
+        if q3.button("Should I buy it?", use_container_width=True):
+            st.session_state.pending_q = (
+                "Should I buy this product? Who is it best for and who should avoid it?"
+            )
 
         st.divider()
 
-        # Show existing chat
+        # -------------------------
+        # Chat history
+        # -------------------------
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-        # Input
-        q = st.chat_input("Ask a question about this product…")
+        # -------------------------
+        # Resolve question (preset OR typed)
+        # -------------------------
+        typed_q = st.chat_input("Ask a question about this product…")
+
+        q = None
+        if st.session_state.pending_q:
+            q = st.session_state.pending_q
+            st.session_state.pending_q = None
+        elif typed_q:
+            q = typed_q
+
+        # -------------------------
+        # Answer
+        # -------------------------
         if q:
+            # user message
             st.session_state.chat_history.append({"role": "user", "content": q})
             with st.chat_message("user"):
                 st.markdown(q)
 
+            # assistant message
             with st.chat_message("assistant"):
                 with st.spinner("Thinking…"):
                     a = ask_openai(q, context_text)
                 st.markdown(a)
-            st.session_state.chat_history.append({"role": "assistant", "content": a})
 
+            st.session_state.chat_history.append({"role": "assistant", "content": a})
     if dialog_fn:
         @st.dialog("🤖 AI Product Copilot (Evidence-Based)")
         def _dlg():
@@ -367,7 +442,7 @@ with right:
     st.subheader(f"🧾 {selected_product}")
 
     # Collapse sections so Copilot feels “primary”
-    with st.expander("🧩 Topics Mentioned in Reviews", expanded=False):
+    with st.expander("🧩 Topics Mentioned in Reviews", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**👍 Positive Topics**")
@@ -384,14 +459,16 @@ with right:
             else:
                 st.write("No negative topics found.")
 
-    with st.expander("⭐ Evidence Reviews (Most Helpful)", expanded=False):
-        colA, colB = st.columns(2)
-        with colA:
-            st.markdown("**👍 Top Positive Review**")
-            st.write(row.get("reviews.text_pos", "No positive review available."))
-        with colB:
-            st.markdown("**👎 Top Negative Review**")
-            st.write(row.get("reviews.text_neg", "No negative review available."))
+with st.expander("⭐ Evidence Reviews (Most Helpful)", expanded=True):
+    colA, colB = st.columns(2)
 
+    pos_text = clean_review_for_display(row.get("reviews.text_pos", ""))
+    neg_text = clean_review_for_display(row.get("reviews.text_neg", ""))
+
+    with colA:
+        safe_render_review("**👍 Top Positive Review**", pos_text)
+
+    with colB:
+        safe_render_review("**👎 Top Negative Review**", neg_text)
 st.divider()
 st.caption("This app uses precomputed ML artifacts: product-level pros/cons summaries, topic modeling outputs, and top evidence reviews.")
