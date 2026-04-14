@@ -103,7 +103,7 @@ This prevents hallucination and ensures responses are:
 
 ---
 
-## ⚡ Performance Optimizations
+## Performance Optimizations
 
 * Batched inference using `DataLoader`
 * Mixed precision (`torch.cuda.amp`)
